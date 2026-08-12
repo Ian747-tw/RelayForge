@@ -26,7 +26,7 @@ type Delivery struct {
 	EventID        int64
 	EndpointID     int64
 	NextAttemptDue *time.Time
-	Status         string
+	Status         DeliveryStatus
 	AttemptsCount  int
 	CreatedAt      time.Time
 	CompletedAt    *time.Time
@@ -54,7 +54,7 @@ type DeliveryDetails struct {
 	ID             int64
 	EventID        int64
 	EndpointID     int64
-	Status         string
+	Status         DeliveryStatus
 	AttemptsCount  int
 	NextAttemptDue *time.Time
 	CreatedAt      time.Time
@@ -62,4 +62,25 @@ type DeliveryDetails struct {
 	EventType   string
 	Payload     json.RawMessage
 	EndpointURL string
+}
+
+type DeliveryStatus string
+
+const (
+	DeliveryStatusPending        DeliveryStatus = "pending"
+	DeliveryStatusProcessing     DeliveryStatus = "processing"
+	DeliveryStatusRetryScheduled DeliveryStatus = "retry_scheduled"
+	DeliveryStatusSucceeded      DeliveryStatus = "succeeded"
+	DeliveryStatusDead           DeliveryStatus = "dead"
+)
+
+type ClaimedDelivery struct {
+	ID           int64
+	EventID      int64
+	EndpointID   int64
+	EventType    string
+	Payload      json.RawMessage
+	EndpointURL  string
+	AttemptCount int
+	ClaimedAt    time.Time
 }
