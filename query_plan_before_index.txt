@@ -1,0 +1,17 @@
+Limit  (cost=1823.05..1823.30 rows=100 width=44) (actual time=24.775..24.807 rows=100 loops=1)
+   Buffers: shared hit=562
+  ->  Sort  (cost=1823.05..1848.31 rows=10101 width=44) (actual time=24.771..24.784 rows=100 loops=1)
+         Sort Key: next_attempt_due, id
+         Sort Method: top-N heapsort  Memory: 45kB
+         Buffers: shared hit=562
+         ->  Seq Scan on deliveries  (cost=0.00..1437.00 rows=10101 width=44) (actual time=0.021..18.931 rows=10000 loops=1)
+               Filter: ((status = ANY ('{pending,retry_scheduled}'::text[])) AND (next_attempt_due <= now()))
+               Rows Removed by Filter: 40000
+               Buffers: shared hit=562
+ Planning:
+   Buffers: shared hit=56
+ Planning Time: 0.388 ms
+ Execution Time: 24.852 ms
+(14 rows)
+
+(END)

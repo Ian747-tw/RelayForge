@@ -1,0 +1,12 @@
+ Limit  (cost=0.29..21.09 rows=100 width=44) (actual time=0.056..0.172 rows=100 loops=1)
+   Buffers: shared hit=100 read=2
+   ->  Index Scan using deliveries_due_idx on deliveries  (cost=0.29..2092.22 rows=10058 width=44) (actual time=0.054..0.150 rows=100 loops=1)
+         Index Cond: (next_attempt_due <= now())
+         Buffers: shared hit=100 read=2
+ Planning:
+   Buffers: shared hit=25 read=1
+ Planning Time: 0.516 ms
+ Execution Time: 0.211 ms
+(9 rows)
+
+(END)
