@@ -58,7 +58,7 @@ processing -----> dead
 
 - claimed_at: Not-NULL only at processing state, cleared when finalizing an attempt.
 
-- next_attempt_at: Earliest time at which the delivery can be claimed. Not-Null only at retry_scheduled state.
+- next_attempt_due: Earliest time at which a pending or retry-scheduled delivery can be claimed. It is always Not-NULL. For processing and terminal deliveries, its stored value is ignored 
 
 ## Delivery Claim
 A delivery is claimable when:
@@ -84,4 +84,52 @@ Transaction B:
     insert delivery_attempt
     update delivery state
     commit
+```
+
+## Claim ordering
+```
+ORDER BY d.next_attempt_at, d.id
+```
+
+## Delivery Eligibility
+
+```
+WHERE d.status IN ('pending', 'retry_scheduled')
+  AND d.next_attempt_at <= now()
+```
+
+## Claim Query
+```
+WITH candidate AS (
+    SELECT d.id
+    FROM deliveries AS d
+    WHERE d.status IN ('pending', 'retry_scheduled')
+      AND d.next_attempt_due <= now()
+    ORDER BY d.next_attempt_due, d.id
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+),
+claimed AS (
+    UPDATE deliveries AS d
+    SET
+        status = 'processing',
+        claimed_at = now()
+    FROM candidate
+    WHERE d.id = candidate.id
+    RETURNING d.*
+)
+SELECT
+    c.id,
+    c.event_id,
+    c.endpoint_id,
+    c.attempts_count,
+    c.claimed_at,
+    e.event_type,
+    e.payload,
+    ep.url
+FROM claimed AS c
+JOIN events AS e
+    ON e.id = c.event_id
+JOIN endpoints AS ep
+    ON ep.id = c.endpoint_id;
 ```

@@ -8,11 +8,12 @@ VALUES
     ('example-2.com', 'secret-2')
 RETURNING id, url, created_at;
 
-INSERT INTO events (event_type, payload, idempotency_key)
+INSERT INTO events (event_type, payload, idempotency_key, request_hash)
 VALUES (
     'invoice.paid',
     '{"invoice_id":"inv_123","amount":500}'::jsonb,
-    'invoice-inv_123-paid-v1'
+    'invoice-inv_123-paid-v1',
+    decode(repeat('00', 32), 'hex')
 )
 RETURNING id AS new_id \gset
 
