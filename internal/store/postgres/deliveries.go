@@ -23,6 +23,7 @@ func (s *Store) GetDelivery(ctx context.Context, id int64) (domain.DeliveryDetai
 		    d.attempts_count,
 		    d.next_attempt_due,
 		    d.created_at,
+			d.claimed_at,
 		    e.event_type,
 		    e.payload,
 		    ep.url
@@ -34,7 +35,7 @@ func (s *Store) GetDelivery(ctx context.Context, id int64) (domain.DeliveryDetai
 		WHERE d.id = $1
 		`,
 		id,
-	).Scan(&d.ID, &d.EventID, &d.EndpointID, &d.Status, &d.AttemptsCount, &d.NextAttemptDue, &d.CreatedAt, &d.EventType, &d.Payload, &d.EndpointURL)
+	).Scan(&d.ID, &d.EventID, &d.EndpointID, &d.Status, &d.AttemptsCount, &d.NextAttemptDue, &d.CreatedAt, &d.ClaimedAt, &d.EventType, &d.Payload, &d.EndpointURL)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.DeliveryDetails{}, domain.ErrNotFound
@@ -57,7 +58,8 @@ func (s *Store) ListDueDeliveries(ctx context.Context, limit int) ([]domain.Deli
 		    attempts_count,
 		    next_attempt_due,
 		    created_at,
-		    completed_at
+		    completed_at,
+			claimed_at
 		FROM deliveries
 		WHERE status IN ('pending', 'retry_scheduled')
 			AND next_attempt_due <= now()
@@ -76,7 +78,7 @@ func (s *Store) ListDueDeliveries(ctx context.Context, limit int) ([]domain.Deli
 	var fetched_data []domain.Delivery
 	for rows.Next() {
 		var d domain.Delivery
-		err := rows.Scan(&d.ID, &d.EventID, &d.EndpointID, &d.Status, &d.AttemptsCount, &d.NextAttemptDue, &d.CreatedAt, &d.CompletedAt)
+		err := rows.Scan(&d.ID, &d.EventID, &d.EndpointID, &d.Status, &d.AttemptsCount, &d.NextAttemptDue, &d.CreatedAt, &d.CompletedAt, &d.ClaimedAt)
 		if err != nil {
 			return []domain.Delivery{}, fmt.Errorf("scanning rows: %w", err)
 		}

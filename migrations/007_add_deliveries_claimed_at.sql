@@ -1,0 +1,2 @@
+ALTER TABLE deliveries
+ADD COLUMN claimed_at TIMESTAMPTZ;

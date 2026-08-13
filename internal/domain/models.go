@@ -30,6 +30,7 @@ type Delivery struct {
 	AttemptsCount  int
 	CreatedAt      time.Time
 	CompletedAt    *time.Time
+	ClaimedAt      *time.Time
 }
 
 type DeliveryAttempt struct {
@@ -58,6 +59,7 @@ type DeliveryDetails struct {
 	AttemptsCount  int
 	NextAttemptDue *time.Time
 	CreatedAt      time.Time
+	ClaimedAt      *time.Time
 
 	EventType   string
 	Payload     json.RawMessage
