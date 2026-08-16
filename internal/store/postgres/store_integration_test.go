@@ -100,6 +100,44 @@ func resetTestDatabase(t *testing.T) {
 	}
 }
 
+func createTestDeliveries(t *testing.T, store *Store, ctx context.Context, number int) {
+	t.Helper()
+
+	endpoints := []int64{}
+
+	for i := 0; i < number; i++ {
+		endpoint, err := store.CreateEndpoint(
+			ctx,
+			fmt.Sprintf("https://%d.test/webhook", i),
+			fmt.Sprintf("secret-%d", i),
+		)
+		if err != nil {
+			t.Fatalf("create endpoint: %v", err)
+		}
+
+		endpoints = append(endpoints, endpoint.ID)
+	}
+
+	params := domain.CreateEventParams{
+		EventType:      "invoice.paid",
+		Payload:        json.RawMessage(`{"invoice_id":"inv-123"}`),
+		IdempotencyKey: "test-fanout-001",
+		EndpointIDs:    endpoints,
+	}
+
+	_, created, err := store.CreateEventWithDeliveries(
+		ctx,
+		params,
+	)
+	if err != nil {
+		t.Fatalf("Create event: %v", err)
+	}
+	if !created {
+		t.Fatal("expect created = true")
+	}
+
+}
+
 func TestCreateEndpoint(t *testing.T) {
 	resetTestDatabase(t)
 	t.Cleanup(func() {
@@ -306,6 +344,87 @@ func TestCreateEventDeliveriesAttemptFlow(t *testing.T) {
 	}
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("expected err not found error, got %v", err)
+	}
+
+	//Test: Claim Due delivery
+	delivery, err := store.ClaimDueDelivery(ctx)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if delivery.ID != 1 {
+		t.Fatalf("expected delivery id 1, got %d", delivery.ID)
+	}
+
+	if delivery.EndpointID != endpointA.ID {
+		t.Fatalf("expected endpoint id %d, got %d", endpointA.ID, delivery.EndpointID)
+	}
+
+	if delivery.EventID != e.ID {
+		t.Fatalf("expected event id %d, got %d", e.ID, delivery.EventID)
+	}
+
+	var (
+		status    string
+		claimedAt *time.Time
+	)
+
+	err = testPool.QueryRow(
+		ctx,
+		`
+		SELECT status, claimed_at
+		FROM deliveries
+		WHERE id = $1
+		`,
+		delivery.ID,
+	).Scan(&status, &claimedAt)
+	if err != nil {
+		t.Fatalf("inspect claimed delivery: %v", err)
+	}
+
+	if status != "processing" {
+		t.Errorf("status = %q, want processing", status)
+	}
+
+	if claimedAt == nil {
+		t.Error("claimed_at is NULL, want non-NULL")
+	}
+
+	//Test future retries
+	_, err = testPool.Exec(
+		ctx,
+		`
+		UPDATE deliveries
+		SET
+			status = 'retry_scheduled',
+			next_attempt_due = now() + interval '1 hour'
+		WHERE id = 2
+		`,
+	)
+
+	_, err = store.ClaimDueDelivery(ctx)
+	if !errors.Is(err, domain.ErrNoDueDeliveries) {
+		t.Fatalf("expected ErrNoDueDeliveries, got %v", err)
+	}
+
+	_, err = testPool.Exec(
+		ctx,
+		`
+		UPDATE deliveries
+		SET
+			status = 'retry_scheduled',
+			next_attempt_due = now() - interval '1 hour'
+		WHERE id = 2
+		`,
+	)
+
+	delivery2, err := store.ClaimDueDelivery(ctx)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if delivery2.ID != 2 {
+		t.Fatalf("expected delivery id 2, got %d", delivery2.ID)
 	}
 
 	//Test: create attempt
@@ -790,6 +909,10 @@ func TestCreateEventWithDeliveriesConcurrentReplay(t *testing.T) {
 
 	const workers = 5
 
+	if testPool.Config().MaxConns < workers {
+		t.Fatal("DB max conns < workers")
+	}
+
 	type result struct {
 		event   domain.Event
 		created bool
@@ -904,4 +1027,273 @@ func TestCreateEventWithDeliveriesConcurrentReplay(t *testing.T) {
 			len(params.EndpointIDs),
 		)
 	}
+}
+
+func TestClaimDueDeliveryEmptyQueue(t *testing.T) {
+	resetTestDatabase(t)
+	t.Cleanup(func() {
+		resetTestDatabase(t)
+	})
+
+	ctx := context.Background()
+	store := New(testPool)
+
+	_, err := store.ClaimDueDelivery(ctx)
+	if !errors.Is(err, domain.ErrNoDueDeliveries) {
+		t.Fatalf("expected NoDueDeliveries error, got %v", err)
+	}
+}
+
+func TestTerminalStateNotClaimed(t *testing.T) {
+	resetTestDatabase(t)
+	t.Cleanup(func() {
+		resetTestDatabase(t)
+	})
+
+	ctx := context.Background()
+	store := New(testPool)
+
+	createTestDeliveries(t, store, ctx, 1)
+
+	tests := []struct {
+		name   string
+		status string
+	}{
+		{name: "procesing", status: "processing"},
+		{name: "succeeded", status: "success"},
+		{name: "dead", status: "dead"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.status == "processing" {
+				_, err := testPool.Exec(
+					ctx,
+					`
+					UPDATE deliveries
+					SET status = $1
+					WHERE id = 1
+					`,
+					tt.status,
+				)
+				if err != nil {
+					t.Fatalf("error updating status: %v", err)
+				}
+			} else {
+				_, err := testPool.Exec(
+					ctx,
+					`
+					UPDATE deliveries
+					SET status = $1, completed_at = now()
+					WHERE id = 1
+					`,
+					tt.status,
+				)
+				if err != nil {
+					t.Fatalf("error updating status: %v", err)
+				}
+			}
+
+			_, err := store.ClaimDueDelivery(ctx)
+			if !errors.Is(err, domain.ErrNoDueDeliveries) {
+				t.Fatalf("expected ErrNoDueDeliveries, got %v", err)
+			}
+
+		})
+	}
+
+}
+
+func TestDeterministicOrdering(t *testing.T) {
+	resetTestDatabase(t)
+	t.Cleanup(func() {
+		resetTestDatabase(t)
+	})
+
+	ctx := context.Background()
+	store := New(testPool)
+
+	createTestDeliveries(t, store, ctx, 2)
+
+	_, err := testPool.Exec(
+		ctx,
+		`
+		UPDATE deliveries
+		SET status = 'retry_scheduled', next_attempt_due = now() - interval '1 minute'
+		WHERE id = 1
+		`,
+	)
+	if err != nil {
+		t.Fatalf("error setting attempt due: %v", err)
+	}
+
+	_, err = testPool.Exec(
+		ctx,
+		`
+		UPDATE deliveries
+		SET status = 'retry_scheduled', next_attempt_due = now() - interval '2 minutes'
+		WHERE id = 2
+		`,
+	)
+	if err != nil {
+		t.Fatalf("error setting attempt due: %v", err)
+	}
+
+	delivery, err := store.ClaimDueDelivery(ctx)
+	if err != nil {
+		t.Fatalf("claim due delivery error: %v", err)
+	}
+
+	if delivery.ID != 2 {
+		t.Fatalf("expected delivery ID 2, got %d", delivery.ID)
+	}
+
+}
+
+func TestClaimDueDeliveryConcurrent(t *testing.T) {
+	resetTestDatabase(t)
+	t.Cleanup(func() {
+		resetTestDatabase(t)
+	})
+
+	ctx := context.Background()
+	store := New(testPool)
+
+	createTestDeliveries(t, store, ctx, 1)
+
+	type result struct {
+		id  int64
+		err error
+	}
+
+	const workers = 5
+
+	if testPool.Config().MaxConns < workers {
+		t.Fatal("DB max conns < workers")
+	}
+
+	start := make(chan struct{})
+	results := make(chan result, workers)
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			d, err := store.ClaimDueDelivery(ctx)
+
+			if err != nil {
+				results <- result{
+					id:  -1,
+					err: err,
+				}
+			} else {
+				results <- result{
+					id:  d.ID,
+					err: err,
+				}
+			}
+		}()
+	}
+
+	close(start)
+
+	wg.Wait()
+
+	close(results)
+
+	claimCount := 0
+	notFoundCount := 0
+
+	for res := range results {
+		if res.err != nil {
+			if !errors.Is(res.err, domain.ErrNoDueDeliveries) {
+				t.Fatalf("unexpected error claiming: %v", res.err)
+			}
+			notFoundCount++
+		} else {
+			if res.id != 1 {
+				t.Fatalf("expected claimed id 1, got %d", res.id)
+			}
+			claimCount++
+		}
+	}
+
+	if claimCount != 1 {
+		t.Fatalf("expected claiming 1, got %d", claimCount)
+	}
+
+	if notFoundCount+claimCount != workers {
+		t.Fatalf("expected receiving %d results, got %d", workers, notFoundCount+claimCount)
+	}
+}
+
+func TestClaimDueDeliveryConcurrentMuitipleRows(t *testing.T) {
+	resetTestDatabase(t)
+	t.Cleanup(func() {
+		resetTestDatabase(t)
+	})
+
+	ctx := context.Background()
+	store := New(testPool)
+
+	const workers = 5
+	if testPool.Config().MaxConns < workers {
+		t.Fatal("DB max conns < workers")
+	}
+
+	createTestDeliveries(t, store, ctx, workers)
+
+	type result struct {
+		id  int64
+		err error
+	}
+
+	start := make(chan struct{})
+	results := make(chan result, workers)
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+
+			d, err := store.ClaimDueDelivery(ctx)
+			if err != nil {
+				results <- result{
+					id:  -1,
+					err: err,
+				}
+			} else {
+				results <- result{
+					id:  d.ID,
+					err: err,
+				}
+			}
+
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(results)
+
+	distinctID := make(map[int64]struct{})
+
+	for res := range results {
+		if res.err != nil {
+			t.Fatalf("expected no err, got %v", res.err)
+		}
+
+		distinctID[res.id] = struct{}{}
+	}
+
+	if len(distinctID) != workers {
+		t.Fatalf("expected claiming %d distinct deliveries, got %d", workers, len(distinctID))
+	}
+
 }
