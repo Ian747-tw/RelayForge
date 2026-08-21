@@ -14,4 +14,6 @@ var (
 	ErrNotFound = errors.New("resource not found")
 
 	ErrNoDueDeliveries = errors.New("no due deliveries")
+
+	ErrDeliveryNotProcessing = errors.New("delivery is not processing")
 )

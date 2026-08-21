@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"sync"
 	"testing"
@@ -136,6 +137,95 @@ func createTestDeliveries(t *testing.T, store *Store, ctx context.Context, numbe
 		t.Fatal("expect created = true")
 	}
 
+}
+
+func assertAttempt(
+	t *testing.T,
+	ctx context.Context,
+	deliveryID int64,
+	wantAttemptNumber int,
+	wantResponseStatus *int,
+	wantErrorMessage *string,
+	wantDurationMS int64,
+) {
+	t.Helper()
+
+	var (
+		attemptNumber  int
+		responseStatus *int
+		errorMessage   *string
+		durationMS     int64
+	)
+
+	err := testPool.QueryRow(
+		ctx,
+		`
+		SELECT
+			attempt_number,
+			response_status,
+			error_message,
+			response_duration_ms
+		FROM delivery_attempts
+		WHERE delivery_id = $1
+		`,
+		deliveryID,
+	).Scan(
+		&attemptNumber,
+		&responseStatus,
+		&errorMessage,
+		&durationMS,
+	)
+	if err != nil {
+		t.Fatalf("query delivery attempt: %v", err)
+	}
+
+	if attemptNumber != wantAttemptNumber {
+		t.Errorf(
+			"attempt_number = %d, want %d",
+			attemptNumber,
+			wantAttemptNumber,
+		)
+	}
+
+	if !equalOptionalInt(responseStatus, wantResponseStatus) {
+		t.Errorf(
+			"response_status = %v, want %v",
+			responseStatus,
+			wantResponseStatus,
+		)
+	}
+
+	if !equalOptionalString(errorMessage, wantErrorMessage) {
+		t.Errorf(
+			"error_message = %v, want %v",
+			errorMessage,
+			wantErrorMessage,
+		)
+	}
+
+	if durationMS != wantDurationMS {
+		t.Errorf(
+			"response_duration_ms = %d, want %d",
+			durationMS,
+			wantDurationMS,
+		)
+	}
+}
+
+func equalOptionalInt(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+
+	return *a == *b
+}
+
+func equalOptionalString(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+
+	return *a == *b
 }
 
 func TestCreateEndpoint(t *testing.T) {
@@ -1296,4 +1386,425 @@ func TestClaimDueDeliveryConcurrentMuitipleRows(t *testing.T) {
 		t.Fatalf("expected claiming %d distinct deliveries, got %d", workers, len(distinctID))
 	}
 
+}
+
+func TestFinalizeDeliveryAttempt(t *testing.T) {
+	resetTestDatabase(t)
+	t.Cleanup(func() {
+		resetTestDatabase(t)
+	})
+
+	ctx := context.Background()
+	store := New(testPool)
+
+	createTestDeliveries(t, store, ctx, 5)
+
+	_, err := testPool.Exec(
+		ctx,
+		`
+		UPDATE deliveries
+		SET status = 'processing'
+		`,
+	)
+	if err != nil {
+		t.Fatalf("update deliveries to processing, %v", err)
+	}
+
+	t.Run("successful delivery", func(t *testing.T) {
+		var deliveryID int64 = 1
+		startedAt := time.Now().Add(-100 * time.Millisecond).UTC()
+		completedAt := time.Now().UTC()
+		responseStatus := http.StatusNoContent
+
+		err := store.FinalizeDeliveryAttempt(
+			ctx,
+			domain.FinalizeDeliveryParams{
+				DeliveryID:         deliveryID,
+				AttemptNumber:      1,
+				StartedAt:          startedAt,
+				CompletedAt:        completedAt,
+				ResponseStatus:     &responseStatus,
+				ErrorMessage:       nil,
+				ResponseDurationMS: 100,
+				Status:             domain.DeliveryStatusSucceeded,
+				NextAttemptDUE:     nil,
+			},
+		)
+		if err != nil {
+			t.Fatalf("FinalizeDeliveryAttempt() error = %v", err)
+		}
+
+		var (
+			status       domain.DeliveryStatus
+			attemptCount int
+			claimedAt    *time.Time
+			finishedAt   *time.Time
+		)
+
+		err = testPool.QueryRow(
+			ctx,
+			`
+			SELECT
+				status,
+				attempts_count,
+				claimed_at,
+				completed_at
+			FROM deliveries
+			WHERE id = $1
+			`,
+			deliveryID,
+		).Scan(
+			&status,
+			&attemptCount,
+			&claimedAt,
+			&finishedAt,
+		)
+		if err != nil {
+			t.Fatalf("query delivery: %v", err)
+		}
+
+		if status != domain.DeliveryStatusSucceeded {
+			t.Errorf(
+				"status = %q, want %q",
+				status,
+				domain.DeliveryStatusSucceeded,
+			)
+		}
+
+		if attemptCount != 1 {
+			t.Errorf("attempts_count = %d, want 1", attemptCount)
+		}
+
+		if claimedAt != nil {
+			t.Errorf("claimed_at = %v, want nil", claimedAt)
+		}
+
+		if finishedAt == nil {
+			t.Error("completed_at = nil, want non-nil")
+		}
+
+		assertAttempt(
+			t,
+			ctx,
+			deliveryID,
+			1,
+			&responseStatus,
+			nil,
+			100,
+		)
+	})
+
+	t.Run("retryable delivery", func(t *testing.T) {
+		var deliveryID int64 = 2
+
+		startedAt := time.Now().Add(-200 * time.Millisecond).UTC()
+		completedAt := time.Now().UTC()
+		nextAttemptAt := completedAt.Add(30 * time.Second)
+		responseStatus := http.StatusInternalServerError
+
+		err := store.FinalizeDeliveryAttempt(
+			ctx,
+			domain.FinalizeDeliveryParams{
+				DeliveryID:         deliveryID,
+				AttemptNumber:      1,
+				StartedAt:          startedAt,
+				CompletedAt:        completedAt,
+				ResponseStatus:     &responseStatus,
+				ErrorMessage:       nil,
+				ResponseDurationMS: 200,
+				Status:             domain.DeliveryStatusRetryScheduled,
+				NextAttemptDUE:     &nextAttemptAt,
+			},
+		)
+		if err != nil {
+			t.Fatalf("FinalizeDeliveryAttempt() error = %v", err)
+		}
+
+		var (
+			status          domain.DeliveryStatus
+			attemptCount    int
+			claimedAt       *time.Time
+			storedNextAt    time.Time
+			storedCompleted *time.Time
+		)
+
+		err = testPool.QueryRow(
+			ctx,
+			`
+			SELECT
+				status,
+				attempts_count,
+				claimed_at,
+				next_attempt_due,
+				completed_at
+			FROM deliveries
+			WHERE id = $1
+			`,
+			deliveryID,
+		).Scan(
+			&status,
+			&attemptCount,
+			&claimedAt,
+			&storedNextAt,
+			&storedCompleted,
+		)
+		if err != nil {
+			t.Fatalf("query delivery: %v", err)
+		}
+
+		if status != domain.DeliveryStatusRetryScheduled {
+			t.Errorf(
+				"status = %q, want %q",
+				status,
+				domain.DeliveryStatusRetryScheduled,
+			)
+		}
+
+		if attemptCount != 1 {
+			t.Errorf("attempts_count = %d, want 1", attemptCount)
+		}
+
+		if claimedAt != nil {
+			t.Errorf("claimed_at = %v, want nil", claimedAt)
+		}
+
+		if storedCompleted != nil {
+			t.Errorf(
+				"completed_at = %v, want nil",
+				storedCompleted,
+			)
+		}
+
+		assertAttempt(
+			t,
+			ctx,
+			deliveryID,
+			1,
+			&responseStatus,
+			nil,
+			200,
+		)
+	})
+
+	t.Run("network failure has null response status", func(t *testing.T) {
+		var deliveryID int64 = 3
+
+		startedAt := time.Now().Add(-150 * time.Millisecond).UTC()
+		completedAt := time.Now().UTC()
+		nextAttemptAt := completedAt.Add(30 * time.Second)
+		errorMessage := "send webhook: connection refused"
+
+		err := store.FinalizeDeliveryAttempt(
+			ctx,
+			domain.FinalizeDeliveryParams{
+				DeliveryID:         deliveryID,
+				AttemptNumber:      1,
+				StartedAt:          startedAt,
+				CompletedAt:        completedAt,
+				ResponseStatus:     nil,
+				ErrorMessage:       &errorMessage,
+				ResponseDurationMS: 150,
+				Status:             domain.DeliveryStatusRetryScheduled,
+				NextAttemptDUE:     &nextAttemptAt,
+			},
+		)
+		if err != nil {
+			t.Fatalf("FinalizeDeliveryAttempt() error = %v", err)
+		}
+
+		assertAttempt(
+			t,
+			ctx,
+			deliveryID,
+			1,
+			nil,
+			&errorMessage,
+			150,
+		)
+	})
+
+	t.Run("permanent failure", func(t *testing.T) {
+		var deliveryID int64 = 4
+
+		startedAt := time.Now().Add(-50 * time.Millisecond).UTC()
+		completedAt := time.Now().UTC()
+		responseStatus := http.StatusBadRequest
+
+		err := store.FinalizeDeliveryAttempt(
+			ctx,
+			domain.FinalizeDeliveryParams{
+				DeliveryID:         deliveryID,
+				AttemptNumber:      1,
+				StartedAt:          startedAt,
+				CompletedAt:        completedAt,
+				ResponseStatus:     &responseStatus,
+				ErrorMessage:       nil,
+				ResponseDurationMS: 50,
+				Status:             domain.DeliveryStatusDead,
+				NextAttemptDUE:     nil,
+			},
+		)
+		if err != nil {
+			t.Fatalf("FinalizeDeliveryAttempt() error = %v", err)
+		}
+
+		var (
+			status       domain.DeliveryStatus
+			attemptCount int
+			claimedAt    *time.Time
+			completed    *time.Time
+		)
+
+		err = testPool.QueryRow(
+			ctx,
+			`
+			SELECT
+				status,
+				attempts_count,
+				claimed_at,
+				completed_at
+			FROM deliveries
+			WHERE id = $1
+			`,
+			deliveryID,
+		).Scan(
+			&status,
+			&attemptCount,
+			&claimedAt,
+			&completed,
+		)
+		if err != nil {
+			t.Fatalf("query delivery: %v", err)
+		}
+
+		if status != domain.DeliveryStatusDead {
+			t.Errorf(
+				"status = %q, want %q",
+				status,
+				domain.DeliveryStatusDead,
+			)
+		}
+
+		if attemptCount != 1 {
+			t.Errorf("attempts_count = %d, want 1", attemptCount)
+		}
+
+		if claimedAt != nil {
+			t.Errorf("claimed_at = %v, want nil", claimedAt)
+		}
+
+		if completed == nil {
+			t.Error("completed_at = nil, want non-nil")
+		}
+
+		assertAttempt(
+			t,
+			ctx,
+			deliveryID,
+			1,
+			&responseStatus,
+			nil,
+			50,
+		)
+	})
+
+	t.Run("non-processing delivery rolls back attempt", func(t *testing.T) {
+		var deliveryID int64 = 5
+
+		// Make the delivery invalid for finalization.
+		_, err := testPool.Exec(
+			ctx,
+			`
+			UPDATE deliveries
+			SET
+				status = 'pending',
+				claimed_at = NULL
+			WHERE id = $1
+			`,
+			deliveryID,
+		)
+		if err != nil {
+			t.Fatalf("change delivery to pending: %v", err)
+		}
+
+		startedAt := time.Now().Add(-100 * time.Millisecond).UTC()
+		completedAt := time.Now().UTC()
+		responseStatus := http.StatusNoContent
+
+		err = store.FinalizeDeliveryAttempt(
+			ctx,
+			domain.FinalizeDeliveryParams{
+				DeliveryID:         deliveryID,
+				AttemptNumber:      1,
+				StartedAt:          startedAt,
+				CompletedAt:        completedAt,
+				ResponseStatus:     &responseStatus,
+				ErrorMessage:       nil,
+				ResponseDurationMS: 100,
+				Status:             domain.DeliveryStatusSucceeded,
+			},
+		)
+
+		if !errors.Is(err, domain.ErrDeliveryNotProcessing) {
+			t.Fatalf(
+				"expected ErrDeliveryNotProcessing, got %v",
+				err,
+			)
+		}
+
+		var attemptCount int
+
+		err = testPool.QueryRow(
+			ctx,
+			`
+			SELECT COUNT(*)
+			FROM delivery_attempts
+			WHERE delivery_id = $1
+			`,
+			deliveryID,
+		).Scan(&attemptCount)
+		if err != nil {
+			t.Fatalf("count delivery attempts: %v", err)
+		}
+
+		if attemptCount != 0 {
+			t.Fatalf(
+				"attempt count = %d, want 0; transaction did not roll back",
+				attemptCount,
+			)
+		}
+
+		var (
+			status             domain.DeliveryStatus
+			storedAttemptCount int
+		)
+
+		err = testPool.QueryRow(
+			ctx,
+			`
+			SELECT status, attempts_count
+			FROM deliveries
+			WHERE id = $1
+			`,
+			deliveryID,
+		).Scan(&status, &storedAttemptCount)
+		if err != nil {
+			t.Fatalf("query delivery: %v", err)
+		}
+
+		if status != domain.DeliveryStatusPending {
+			t.Errorf(
+				"status = %q, want %q",
+				status,
+				domain.DeliveryStatusPending,
+			)
+		}
+
+		if storedAttemptCount != 0 {
+			t.Errorf(
+				"attempts_count = %d, want 0",
+				storedAttemptCount,
+			)
+		}
+	})
 }

@@ -72,7 +72,7 @@ const (
 	DeliveryStatusPending        DeliveryStatus = "pending"
 	DeliveryStatusProcessing     DeliveryStatus = "processing"
 	DeliveryStatusRetryScheduled DeliveryStatus = "retry_scheduled"
-	DeliveryStatusSucceeded      DeliveryStatus = "succeeded"
+	DeliveryStatusSucceeded      DeliveryStatus = "success"
 	DeliveryStatusDead           DeliveryStatus = "dead"
 )
 
@@ -85,4 +85,17 @@ type ClaimedDelivery struct {
 	EndpointURL  string
 	AttemptCount int
 	ClaimedAt    time.Time
+}
+
+type FinalizeDeliveryParams struct {
+	DeliveryID         int64
+	AttemptNumber      int
+	StartedAt          time.Time
+	CompletedAt        time.Time
+	ResponseStatus     *int
+	ErrorMessage       *string
+	ResponseDurationMS int64
+
+	Status         DeliveryStatus
+	NextAttemptDUE *time.Time
 }
