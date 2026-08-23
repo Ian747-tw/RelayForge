@@ -1808,3 +1808,567 @@ func TestFinalizeDeliveryAttempt(t *testing.T) {
 		}
 	})
 }
+
+func TestRecoverStaleDeliveriesRecoversExpiredClaim(
+	t *testing.T,
+) {
+	resetTestDatabase(t)
+	t.Cleanup(func() {
+		resetTestDatabase(t)
+	})
+
+	ctx := context.Background()
+	store := New(testPool)
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	staleClaimedAt := now.Add(-2 * time.Minute)
+	staleBefore := now.Add(-time.Minute)
+
+	deliveryID := seedProcessingDelivery(t, ctx, store)
+
+	_, err := testPool.Exec(
+		ctx,
+		`
+		UPDATE deliveries
+		SET
+			status = 'processing',
+			claimed_at = $2,
+			attempts_count = 3,
+			completed_at = NULL
+		WHERE id = $1
+		`,
+		deliveryID,
+		staleClaimedAt,
+	)
+	if err != nil {
+		t.Fatalf("prepare stale delivery: %v", err)
+	}
+
+	recovered, err := store.RecoverStaleDeliveries(
+		ctx,
+		staleBefore,
+		now,
+	)
+	if err != nil {
+		t.Fatalf("RecoverStaleDeliveries() error = %v", err)
+	}
+
+	if recovered != 1 {
+		t.Fatalf("recovered = %d, want 1", recovered)
+	}
+
+	var (
+		status         string
+		claimedAt      *time.Time
+		nextAttemptDue time.Time
+		attemptsCount  int
+		completedAt    *time.Time
+	)
+
+	err = testPool.QueryRow(
+		ctx,
+		`
+		SELECT
+			status,
+			claimed_at,
+			next_attempt_due,
+			attempts_count,
+			completed_at
+		FROM deliveries
+		WHERE id = $1
+		`,
+		deliveryID,
+	).Scan(
+		&status,
+		&claimedAt,
+		&nextAttemptDue,
+		&attemptsCount,
+		&completedAt,
+	)
+	if err != nil {
+		t.Fatalf("query recovered delivery: %v", err)
+	}
+
+	if status != "retry_scheduled" {
+		t.Errorf(
+			"status = %q, want retry_scheduled",
+			status,
+		)
+	}
+
+	if claimedAt != nil {
+		t.Errorf("claimed_at = %v, want nil", claimedAt)
+	}
+
+	if !nextAttemptDue.Equal(now) {
+		t.Errorf(
+			"next_attempt_due = %v, want %v",
+			nextAttemptDue,
+			now,
+		)
+	}
+
+	if attemptsCount != 3 {
+		t.Errorf(
+			"attempts_count = %d, want 3",
+			attemptsCount,
+		)
+	}
+
+	if completedAt != nil {
+		t.Errorf(
+			"completed_at = %v, want nil",
+			completedAt,
+		)
+	}
+}
+
+func TestRecoverStaleDeliveriesLeavesFreshClaimUntouched(
+	t *testing.T,
+) {
+	resetTestDatabase(t)
+	t.Cleanup(func() {
+		resetTestDatabase(t)
+	})
+
+	ctx := context.Background()
+	store := New(testPool)
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	freshClaimedAt := now.Add(-30 * time.Second)
+	staleBefore := now.Add(-time.Minute)
+
+	deliveryID := seedProcessingDelivery(t, ctx, store)
+
+	_, err := testPool.Exec(
+		ctx,
+		`
+		UPDATE deliveries
+		SET
+			status = 'processing',
+			claimed_at = $2,
+			attempts_count = 2
+		WHERE id = $1
+		`,
+		deliveryID,
+		freshClaimedAt,
+	)
+	if err != nil {
+		t.Fatalf("prepare fresh delivery: %v", err)
+	}
+
+	recovered, err := store.RecoverStaleDeliveries(
+		ctx,
+		staleBefore,
+		now,
+	)
+	if err != nil {
+		t.Fatalf("RecoverStaleDeliveries() error = %v", err)
+	}
+
+	if recovered != 0 {
+		t.Fatalf("recovered = %d, want 0", recovered)
+	}
+
+	var (
+		status        string
+		claimedAt     *time.Time
+		attemptsCount int
+	)
+
+	err = testPool.QueryRow(
+		ctx,
+		`
+		SELECT
+			status,
+			claimed_at,
+			attempts_count
+		FROM deliveries
+		WHERE id = $1
+		`,
+		deliveryID,
+	).Scan(
+		&status,
+		&claimedAt,
+		&attemptsCount,
+	)
+	if err != nil {
+		t.Fatalf("query fresh delivery: %v", err)
+	}
+
+	if status != "processing" {
+		t.Errorf("status = %q, want processing", status)
+	}
+
+	if claimedAt == nil {
+		t.Fatal("claimed_at = nil, want non-nil")
+	}
+
+	if !claimedAt.Equal(freshClaimedAt) {
+		t.Errorf(
+			"claimed_at = %v, want %v",
+			claimedAt,
+			freshClaimedAt,
+		)
+	}
+
+	if attemptsCount != 2 {
+		t.Errorf(
+			"attempts_count = %d, want 2",
+			attemptsCount,
+		)
+	}
+}
+
+func TestRecoveredDeliveryCanBeClaimedAgain(t *testing.T) {
+	resetTestDatabase(t)
+	t.Cleanup(func() {
+		resetTestDatabase(t)
+	})
+
+	ctx := context.Background()
+	store := New(testPool)
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	deliveryID := seedProcessingDelivery(t, ctx, store)
+
+	_, err := testPool.Exec(
+		ctx,
+		`
+		UPDATE deliveries
+		SET
+			status = 'processing',
+			claimed_at = $2
+		WHERE id = $1
+		`,
+		deliveryID,
+		now.Add(-2*time.Minute),
+	)
+	if err != nil {
+		t.Fatalf("prepare stale delivery: %v", err)
+	}
+
+	recovered, err := store.RecoverStaleDeliveries(
+		ctx,
+		now.Add(-time.Minute),
+
+		// Slightly in the past so the database's now()
+		// definitely considers it due.
+		now.Add(-time.Second),
+	)
+	if err != nil {
+		t.Fatalf("recover stale delivery: %v", err)
+	}
+
+	if recovered != 1 {
+		t.Fatalf("recovered = %d, want 1", recovered)
+	}
+
+	claimed, err := store.ClaimDueDelivery(ctx)
+	if err != nil {
+		t.Fatalf("claim recovered delivery: %v", err)
+	}
+
+	if claimed.ID != deliveryID {
+		t.Errorf(
+			"claimed delivery ID = %d, want %d",
+			claimed.ID,
+			deliveryID,
+		)
+	}
+}
+
+func TestRecoverStaleDeliveriesIgnoresOtherStates(
+	t *testing.T,
+) {
+	tests := []struct {
+		name        string
+		status      string
+		completedAt bool
+	}{
+		{
+			name:   "pending",
+			status: "pending",
+		},
+		{
+			name:   "retry scheduled",
+			status: "retry_scheduled",
+		},
+		{
+			name:        "succeeded",
+			status:      "success",
+			completedAt: true,
+		},
+		{
+			name:        "dead",
+			status:      "dead",
+			completedAt: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetTestDatabase(t)
+			t.Cleanup(func() {
+				resetTestDatabase(t)
+			})
+
+			ctx := context.Background()
+			store := New(testPool)
+
+			now := time.Now().
+				UTC().
+				Truncate(time.Microsecond)
+
+			deliveryID := seedProcessingDelivery(
+				t,
+				ctx,
+				store,
+			)
+
+			var completedAt *time.Time
+			if tt.completedAt {
+				value := now
+				completedAt = &value
+			}
+
+			_, err := testPool.Exec(
+				ctx,
+				`
+				UPDATE deliveries
+				SET
+					status = $2,
+					claimed_at = NULL,
+					completed_at = $3
+				WHERE id = $1
+				`,
+				deliveryID,
+				tt.status,
+				completedAt,
+			)
+			if err != nil {
+				t.Fatalf(
+					"prepare %s delivery: %v",
+					tt.status,
+					err,
+				)
+			}
+
+			recovered, err :=
+				store.RecoverStaleDeliveries(
+					ctx,
+					now.Add(-time.Minute),
+					now,
+				)
+			if err != nil {
+				t.Fatalf(
+					"RecoverStaleDeliveries() error = %v",
+					err,
+				)
+			}
+
+			if recovered != 0 {
+				t.Fatalf(
+					"recovered = %d, want 0",
+					recovered,
+				)
+			}
+
+			var storedStatus string
+
+			err = testPool.QueryRow(
+				ctx,
+				`
+				SELECT status
+				FROM deliveries
+				WHERE id = $1
+				`,
+				deliveryID,
+			).Scan(&storedStatus)
+			if err != nil {
+				t.Fatalf(
+					"query delivery: %v",
+					err,
+				)
+			}
+
+			if storedStatus != tt.status {
+				t.Errorf(
+					"status = %q, want %q",
+					storedStatus,
+					tt.status,
+				)
+			}
+		})
+	}
+}
+
+func TestRecoverStaleDeliveriesWithNoMatches(t *testing.T) {
+	resetTestDatabase(t)
+	t.Cleanup(func() {
+		resetTestDatabase(t)
+	})
+
+	ctx := context.Background()
+	store := New(testPool)
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	recovered, err := store.RecoverStaleDeliveries(
+		ctx,
+		now.Add(-time.Minute),
+		now,
+	)
+	if err != nil {
+		t.Fatalf("RecoverStaleDeliveries() error = %v", err)
+	}
+
+	if recovered != 0 {
+		t.Errorf("recovered = %d, want 0", recovered)
+	}
+}
+
+func TestRecoveredDeliveryRejectsLateFinalization(
+	t *testing.T,
+) {
+	resetTestDatabase(t)
+	t.Cleanup(func() {
+		resetTestDatabase(t)
+	})
+
+	ctx := context.Background()
+	store := New(testPool)
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	deliveryID := seedProcessingDelivery(t, ctx, store)
+
+	_, err := testPool.Exec(
+		ctx,
+		`
+		UPDATE deliveries
+		SET claimed_at = $2
+		WHERE id = $1
+		`,
+		deliveryID,
+		now.Add(-2*time.Minute),
+	)
+	if err != nil {
+		t.Fatalf("prepare stale delivery: %v", err)
+	}
+
+	recovered, err := store.RecoverStaleDeliveries(
+		ctx,
+		now.Add(-time.Minute),
+		now,
+	)
+	if err != nil {
+		t.Fatalf("recover stale delivery: %v", err)
+	}
+
+	if recovered != 1 {
+		t.Fatalf("recovered = %d, want 1", recovered)
+	}
+
+	responseStatus := http.StatusNoContent
+
+	err = store.FinalizeDeliveryAttempt(
+		ctx,
+		domain.FinalizeDeliveryParams{
+			DeliveryID:         deliveryID,
+			AttemptNumber:      1,
+			StartedAt:          now.Add(-time.Second),
+			CompletedAt:        now,
+			ResponseStatus:     &responseStatus,
+			ResponseDurationMS: 1000,
+			Status:             domain.DeliveryStatusSucceeded,
+		},
+	)
+
+	if !errors.Is(err, domain.ErrDeliveryNotProcessing) {
+		t.Fatalf(
+			"error = %v, want ErrDeliveryNotProcessing",
+			err,
+		)
+	}
+
+	var attemptRows int
+
+	err = testPool.QueryRow(
+		ctx,
+		`
+		SELECT COUNT(*)
+		FROM delivery_attempts
+		WHERE delivery_id = $1
+		`,
+		deliveryID,
+	).Scan(&attemptRows)
+	if err != nil {
+		t.Fatalf("count delivery attempts: %v", err)
+	}
+
+	if attemptRows != 0 {
+		t.Errorf(
+			"attempt rows = %d, want 0",
+			attemptRows,
+		)
+	}
+}
+
+func seedProcessingDelivery(
+	t *testing.T,
+	ctx context.Context,
+	store *Store,
+) int64 {
+	t.Helper()
+
+	unique := time.Now().UnixNano()
+
+	endpoint, err := store.CreateEndpoint(
+		ctx,
+		fmt.Sprintf(
+			"https://example.com/webhook/%d",
+			unique,
+		),
+		fmt.Sprintf("test-secret-%d", unique),
+	)
+	if err != nil {
+		t.Fatalf("create endpoint: %v", err)
+	}
+
+	params := domain.CreateEventParams{
+		EventType: "test.event",
+		Payload: json.RawMessage(
+			`{"source":"recovery-test"}`,
+		),
+		IdempotencyKey: fmt.Sprintf(
+			"recovery-test-%d",
+			unique,
+		),
+		EndpointIDs: []int64{endpoint.ID},
+	}
+
+	_, _, err = store.CreateEventWithDeliveries(
+		ctx,
+		params,
+	)
+	if err != nil {
+		t.Fatalf("create event with delivery: %v", err)
+	}
+
+	claimed, err := store.ClaimDueDelivery(ctx)
+	if err != nil {
+		t.Fatalf("claim delivery: %v", err)
+	}
+
+	if claimed.EndpointID != endpoint.ID {
+		t.Fatalf(
+			"claimed endpoint ID = %d, want %d",
+			claimed.EndpointID,
+			endpoint.ID,
+		)
+	}
+
+	return claimed.ID
+}

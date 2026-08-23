@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/Ian747-tw/relayforge/internal/domain"
 	"github.com/jackc/pgx/v5"
@@ -90,4 +91,30 @@ func (s *Store) ListDueDeliveries(ctx context.Context, limit int) ([]domain.Deli
 	}
 
 	return fetched_data, nil
+}
+
+func (s *Store) RecoverStaleDeliveries(
+	ctx context.Context,
+	staleBefore time.Time,
+	retryAt time.Time,
+) (int64, error) {
+	tag, err := s.pool.Exec(
+		ctx,
+		`
+		UPDATE deliveries
+		SET
+			status = 'retry_scheduled',
+			claimed_at = NULL,
+			next_attempt_due = $2::timestamptz,
+			completed_at = NULL
+		WHERE status = 'processing' AND claimed_at < $1::timestamptz
+		`,
+		staleBefore,
+		retryAt,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("recover stale delivery: %v", err)
+	}
+
+	return tag.RowsAffected(), nil
 }

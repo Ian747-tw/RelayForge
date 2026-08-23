@@ -16,6 +16,14 @@ type Store interface {
 	) (domain.ClaimedDelivery, error)
 }
 
+type RecoveryStore interface {
+	RecoverStaleDeliveries(
+		context.Context,
+		time.Time,
+		time.Time,
+	) (int64, error)
+}
+
 type Processor interface {
 	Process(
 		context.Context,
