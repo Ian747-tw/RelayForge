@@ -14,6 +14,7 @@ import (
 
 type SendResult struct {
 	StatusCode  int
+	RetryAfter  string
 	StartedAt   time.Time
 	CompletedAt time.Time
 	Duration    time.Duration
@@ -100,6 +101,8 @@ func (s *Sender) Send(
 			copyErr,
 		)
 	}
+
+	result.RetryAfter = resp.Header.Get("Retry-After")
 
 	return result, nil
 }

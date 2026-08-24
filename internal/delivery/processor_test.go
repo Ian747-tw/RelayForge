@@ -165,11 +165,20 @@ func TestProcessorProcess(t *testing.T) {
 
 			finalizer := &fakeFinalizer{}
 
+			retryPolicy, err := NewRetryPolicy(
+				30*time.Second,
+				45*time.Minute,
+				noJitter,
+			)
+			if err != nil {
+				t.Fatalf("create retry policy: %v", err)
+			}
+
 			processor := NewProcessor(
 				sender,
 				finalizer,
 				8,
-				30*time.Second,
+				retryPolicy,
 			)
 
 			claimed := domain.ClaimedDelivery{
@@ -180,7 +189,7 @@ func TestProcessorProcess(t *testing.T) {
 				AttemptCount: tt.attemptCount,
 			}
 
-			err := processor.Process(context.Background(), claimed)
+			err = processor.Process(context.Background(), claimed)
 			if err != nil {
 				t.Fatalf("Process() error = %v", err)
 			}
@@ -305,14 +314,23 @@ func TestProcessorProcessCancellationDoesNotFinalize(t *testing.T) {
 
 	finalizer := &fakeFinalizer{}
 
+	retryPolicy, err := NewRetryPolicy(
+		30*time.Second,
+		45*time.Minute,
+		noJitter,
+	)
+	if err != nil {
+		t.Fatalf("create retry policy: %v", err)
+	}
+
 	processor := NewProcessor(
 		sender,
 		finalizer,
 		8,
-		30*time.Second,
+		retryPolicy,
 	)
 
-	err := processor.Process(
+	err = processor.Process(
 		context.Background(),
 		domain.ClaimedDelivery{
 			ID:           10,
@@ -357,14 +375,23 @@ func TestProcessorProcessReturnsFinalizerError(t *testing.T) {
 		err: finalizeErr,
 	}
 
+	retryPolicy, err := NewRetryPolicy(
+		30*time.Second,
+		45*time.Minute,
+		noJitter,
+	)
+	if err != nil {
+		t.Fatalf("create retry policy: %v", err)
+	}
+
 	processor := NewProcessor(
 		sender,
 		finalizer,
 		8,
-		30*time.Second,
+		retryPolicy,
 	)
 
-	err := processor.Process(
+	err = processor.Process(
 		context.Background(),
 		domain.ClaimedDelivery{
 			ID:           10,

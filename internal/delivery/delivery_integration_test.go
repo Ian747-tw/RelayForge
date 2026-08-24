@@ -20,6 +20,10 @@ import (
 
 var testPool *pgxpool.Pool
 
+func noJitter(max time.Duration) time.Duration {
+	return 0
+}
+
 func TestMain(m *testing.M) {
 	databaseURL := "postgresql://relayforge:relayforge_dev_password@localhost:5432/relayforge_test"
 
@@ -116,11 +120,20 @@ func TestDeliveryEndToEnd(t *testing.T) {
 		store := postgres.New(testPool)
 		sender := NewSender(2 * time.Second)
 
+		retryPolicy, err := NewRetryPolicy(
+			30*time.Second,
+			45*time.Minute,
+			noJitter,
+		)
+		if err != nil {
+			t.Fatalf("create retry policy: %v", err)
+		}
+
 		processor := NewProcessor(
 			sender,
 			store,
 			8,
-			30*time.Second,
+			retryPolicy,
 		)
 
 		type receivedRequest struct {
@@ -352,11 +365,20 @@ func TestDeliveryEndToEnd(t *testing.T) {
 		store := postgres.New(testPool)
 		sender := NewSender(2 * time.Second)
 
+		retryPolicy, err := NewRetryPolicy(
+			30*time.Second,
+			45*time.Minute,
+			noJitter,
+		)
+		if err != nil {
+			t.Fatalf("create retry policy: %v", err)
+		}
+
 		processor := NewProcessor(
 			sender,
 			store,
 			8,
-			30*time.Second,
+			retryPolicy,
 		)
 
 		type receivedRequest struct {
@@ -596,11 +618,20 @@ func TestDeliveryEndToEnd(t *testing.T) {
 		store := postgres.New(testPool)
 		sender := NewSender(2 * time.Second)
 
+		retryPolicy, err := NewRetryPolicy(
+			1*time.Second,
+			45*time.Minute,
+			noJitter,
+		)
+		if err != nil {
+			t.Fatalf("create retry policy: %v", err)
+		}
+
 		processor := NewProcessor(
 			sender,
 			store,
 			8,
-			1*time.Second,
+			retryPolicy,
 		)
 
 		type receivedRequest struct {
@@ -843,11 +874,20 @@ func TestDeliveryEndToEnd(t *testing.T) {
 		store := postgres.New(testPool)
 		sender := NewSender(2 * time.Second)
 
+		retryPolicy, err := NewRetryPolicy(
+			1*time.Second,
+			45*time.Minute,
+			noJitter,
+		)
+		if err != nil {
+			t.Fatalf("create retry policy: %v", err)
+		}
+
 		processor := NewProcessor(
 			sender,
 			store,
 			8,
-			1*time.Second,
+			retryPolicy,
 		)
 
 		type receivedRequest struct {

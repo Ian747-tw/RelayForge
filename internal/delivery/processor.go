@@ -3,7 +3,6 @@ package delivery
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/Ian747-tw/relayforge/internal/domain"
 )
@@ -26,28 +25,24 @@ type Processor struct {
 	sender      WebhookSender
 	finalizer   Finalizer
 	maxAttempts int
-	retryDelay  time.Duration
+	retryPolicy RetryPolicy
 }
 
 func NewProcessor(
 	sender WebhookSender,
 	finalizer Finalizer,
 	maxAttempts int,
-	retryDelay time.Duration,
+	retryPolicy RetryPolicy,
 ) *Processor {
 	if maxAttempts <= 0 {
 		panic("max attempts must be positive")
-	}
-
-	if retryDelay <= 0 {
-		panic("retry delay must be positive")
 	}
 
 	return &Processor{
 		sender:      sender,
 		finalizer:   finalizer,
 		maxAttempts: maxAttempts,
-		retryDelay:  retryDelay,
+		retryPolicy: retryPolicy,
 	}
 }
 
@@ -96,7 +91,15 @@ func (p *Processor) Process(
 		if attemptNumber >= p.maxAttempts {
 			params.Status = domain.DeliveryStatusDead
 		} else {
-			nextAttemptDue := result.CompletedAt.Add(p.retryDelay)
+			delay := p.retryPolicy.NextDelay(
+				attemptNumber,
+				result.StatusCode,
+				result.RetryAfter,
+				result.CompletedAt,
+			)
+
+			nextAttemptDue := result.CompletedAt.Add(delay)
+
 			params.Status = domain.DeliveryStatusRetryScheduled
 			params.NextAttemptDUE = &nextAttemptDue
 		}
