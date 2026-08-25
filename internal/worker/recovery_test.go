@@ -2,7 +2,8 @@ package worker
 
 import (
 	"context"
-	"errors"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 )
@@ -37,7 +38,18 @@ func (f *fakeRecoveryStore) RecoverStaleDeliveries(
 
 }
 
-func TestRecoveryRunnerRunsImmediatelyAndStops(t *testing.T) {
+func testLogger() *slog.Logger {
+	return slog.New(
+		slog.NewTextHandler(
+			io.Discard,
+			nil,
+		),
+	)
+}
+
+func TestRecoveryRunnerRunsImmediatelyAndStops(
+	t *testing.T,
+) {
 	store := &fakeRecoveryStore{
 		calls: make(chan recoveryCall, 1),
 	}
@@ -46,17 +58,24 @@ func TestRecoveryRunnerRunsImmediatelyAndStops(t *testing.T) {
 		store,
 		time.Minute,
 		time.Hour,
+		testLogger(),
 	)
 	if err != nil {
-		t.Fatalf("NewRecoveryRunner() error = %v", err)
+		t.Fatalf(
+			"NewRecoveryRunner() error = %v",
+			err,
+		)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(
+		context.Background(),
+	)
 
-	done := make(chan error, 1)
+	done := make(chan struct{})
 
 	go func() {
-		done <- runner.Run(ctx)
+		defer close(done)
+		runner.Run(ctx)
 	}()
 
 	var call recoveryCall
@@ -72,7 +91,7 @@ func TestRecoveryRunnerRunsImmediatelyAndStops(t *testing.T) {
 
 	if gotLease != time.Minute {
 		t.Errorf(
-			"expected recovery lease 1m, got %v",
+			"recovery lease = %v, want 1m",
 			gotLease,
 		)
 	}
@@ -80,13 +99,11 @@ func TestRecoveryRunnerRunsImmediatelyAndStops(t *testing.T) {
 	cancel()
 
 	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("expected error context.Canceled, got %v", err)
-		}
+	case <-done:
 
 	case <-time.After(time.Second):
-		t.Fatal("recovery runner did not stop")
+		t.Fatal(
+			"recovery runner did not stop after cancellation",
+		)
 	}
-
 }

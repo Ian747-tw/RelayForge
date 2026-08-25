@@ -6,15 +6,21 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Ian747-tw/relayforge/internal/delivery"
 	"github.com/Ian747-tw/relayforge/internal/domain"
 	"github.com/Ian747-tw/relayforge/internal/httpapi"
 	"github.com/Ian747-tw/relayforge/internal/store/postgres"
+	"github.com/Ian747-tw/relayforge/internal/worker"
 )
 
 func main() {
@@ -30,10 +36,7 @@ func run() error {
 		)
 	}
 
-	databaseURL := os.Getenv("TEST_DATABASE_URL")
-	if databaseURL == "" {
-		return fmt.Errorf("TEST_DATABASE_URL is required")
-	}
+	databaseURL := "postgresql://relayforge:relayforge_dev_password@localhost:5432/relayforge_test"
 
 	ctx := context.Background()
 
@@ -60,7 +63,15 @@ func run() error {
 		return runInspect(ctx, store)
 
 	case "serve":
-		return runServer(store)
+		logger := slog.New(
+			slog.NewTextHandler(
+				os.Stdout,
+				&slog.HandlerOptions{
+					Level: slog.LevelInfo,
+				},
+			),
+		)
+		return runServe(store, logger)
 
 	default:
 		return fmt.Errorf(
@@ -94,17 +105,6 @@ func runSeed(
 ) error {
 	fmt.Println("Creating test data...")
 
-	// TODO:
-	// 1. Call CreateEndpoint twice.
-	// 2. Print both endpoint IDs.
-	// 3. Call CreateEventWithDeliveries with both IDs.
-	// 4. Print the event ID.
-	//
-	// endpointA, err := store.CreateEndpoint(...)
-	// ...
-	//
-	// event, err := store.CreateEventWithDeliveries(...)
-	// ...
 	endpointA, err := store.CreateEndpoint(ctx, "example-1", "secret-1")
 	if err != nil {
 		return fmt.Errorf("create endpoint: %v", err)
@@ -143,14 +143,6 @@ func runInspect(
 ) error {
 	fmt.Println("Inspecting stored data...")
 
-	// TODO:
-	// Call your read queries and print their results.
-	//
-	// endpoints, err := store.ListActiveEndpoints(ctx)
-	// ...
-	//
-	// delivery, err := store.GetDelivery(ctx, id)
-	// ...
 	endpoints, err := store.ListActiveEndpoints(ctx)
 	if err != nil {
 		return fmt.Errorf("listing endpoints: %v", err)
@@ -162,27 +154,269 @@ func runInspect(
 	return nil
 }
 
-func runServer(store *postgres.Store) error {
+func runServe(store *postgres.Store, logger *slog.Logger) error {
+	//config
+	const (
+		workerCount       = 4
+		workerPollDelay   = 250 * time.Millisecond
+		senderTimeout     = 10 * time.Second
+		claimLease        = 60 * time.Second
+		recoveryInterval  = 15 * time.Second
+		httpStopTimeout   = 10 * time.Second
+		workerStopTimeout = 10 * time.Second
+		maxAttempts       = 8
+	)
+
+	if store == nil {
+		return fmt.Errorf("store is nil")
+	}
+
+	if logger == nil {
+		return fmt.Errorf("logger is nil")
+	}
+
+	if claimLease <= senderTimeout {
+		return fmt.Errorf("claim lease must exceed sender timeout")
+	}
+
+	//construct dependencies
+	sender := delivery.NewSender(senderTimeout)
+
+	retryPolicy, err := delivery.NewRetryPolicy(
+		5*time.Second,
+		15*time.Minute,
+		delivery.RandomJitter,
+	)
+	if err != nil {
+		return fmt.Errorf("create retry policy: %w", err)
+	}
+
+	processor := delivery.NewProcessor(
+		sender,
+		store,
+		8,
+		retryPolicy,
+	)
+
+	recoveryLogger := logger.With(
+		"component", "stale_claim_recovery",
+	)
+
+	recoveryRunner, err := worker.NewRecoveryRunner(
+		store,
+		claimLease,
+		recoveryInterval,
+		recoveryLogger,
+	)
+	if err != nil {
+		return fmt.Errorf("create recovery runner: %w", err)
+	}
+
+	//create lifecycle contexts
+	signalCtx, stopSignals := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stopSignals()
+
+	workerCtx, cancelWorkers := context.WithCancel(context.Background())
+	defer cancelWorkers()
+
+	//start delivery workers
+	var backgroundWG sync.WaitGroup
+
+	for workerID := range workerCount {
+		workerLogger := logger.With(
+			"component", "delivery_worker",
+			"worker_id", workerID,
+		)
+
+		deliveryWorker := worker.New(
+			store,
+			processor,
+			workerPollDelay,
+			workerLogger,
+		)
+
+		backgroundWG.Add(1)
+
+		go func(w *worker.Worker) {
+			defer backgroundWG.Done()
+			w.Run(workerCtx)
+		}(deliveryWorker)
+	}
+
+	//start one stale-claim recovery runner
+	backgroundWG.Add(1)
+
+	go func() {
+		defer backgroundWG.Done()
+		recoveryRunner.Run(workerCtx)
+	}()
+
+	//construct existing HTTP API
 	api := httpapi.New(store)
 
-	server := &http.Server{
-		Addr:              httpAddress(),
+	httpServer := &http.Server{
+		Addr:              ":8080",
 		Handler:           api,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      15 * time.Second,
+		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    1 << 20,
 	}
 
-	fmt.Printf("RelayForge listening on %s\n", server.Addr)
+	//listen and serve
+	serverResult := make(chan error, 1)
 
-	err := server.ListenAndServe()
-	if err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("server HTTP: %w", err)
+	go func() {
+		serverResult <- httpServer.ListenAndServe()
+	}()
+
+	logger.Info(
+		"RelayForge started",
+		"address", httpServer.Addr,
+		"worker_count", workerCount,
+		"sender_timeout", senderTimeout,
+		"claim_lease", claimLease,
+		"recovery_interval", recoveryInterval,
+	)
+
+	var runErr error
+	serverAlreadyStopped := false
+
+	select {
+	case <-signalCtx.Done():
+		logger.Info(
+			"shutdown signal received",
+			"signal_error", signalCtx.Err(),
+		)
+	case err := <-serverResult:
+		serverAlreadyStopped = true
+
+		if err == nil {
+			runErr = errors.New(
+				"HTTP server stopped unexpectedly without error",
+			)
+		} else if errors.Is(err, http.ErrServerClosed) {
+			runErr = errors.New(
+				"HTTP server was closed unexpectedly",
+			)
+		} else {
+			runErr = fmt.Errorf(
+				"HTTP server failed: %w",
+				err,
+			)
+		}
 	}
+
+	//first stop accepting inbound API requests and allow
+	//active handlers to finish.
+	httpShutdownCtx, cancelHTTPShutdown :=
+		context.WithTimeout(
+			context.Background(),
+			httpStopTimeout,
+		)
+
+	httpShutdownErr :=
+		httpServer.Shutdown(httpShutdownCtx)
+
+	cancelHTTPShutdown()
+
+	if httpShutdownErr != nil {
+		runErr = errors.Join(
+			runErr,
+			fmt.Errorf(
+				"graceful HTTP shutdown: %w",
+				httpShutdownErr,
+			),
+		)
+
+		//shutdown did not finish gracefully. Force remaining
+		//ordinary HTTP connections close
+		if closeErr := httpServer.Close(); closeErr != nil {
+			runErr = errors.Join(
+				runErr,
+				fmt.Errorf(
+					"force close HTTP server: %w",
+					closeErr,
+				),
+			)
+		}
+	}
+
+	//if ListenAndServe had not already returned, wait for it
+	if !serverAlreadyStopped {
+		select {
+		case err := <-serverResult:
+			if err != nil &&
+				!errors.Is(err, http.ErrServerClosed) {
+				runErr = errors.Join(
+					runErr,
+					fmt.Errorf(
+						"HTTP server exit: %w",
+						err,
+					),
+				)
+			}
+
+		case <-time.After(time.Second):
+			runErr = errors.Join(
+				runErr,
+				errors.New(
+					"HTTP server goroutine did not exit",
+				),
+			)
+		}
+	}
+
+	//stop background workers
+	cancelWorkers()
+
+	backgroundDone := make(chan struct{})
+
+	go func() {
+		backgroundWG.Wait()
+		close(backgroundDone)
+	}()
+
+	workerShutdownCtx, cancelWorkerShutdown :=
+		context.WithTimeout(
+			context.Background(),
+			workerStopTimeout,
+		)
+	defer cancelWorkerShutdown()
+
+	select {
+	case <-backgroundDone:
+		logger.Info(
+			"background workers stopped",
+		)
+
+	case <-workerShutdownCtx.Done():
+		runErr = errors.Join(
+			runErr,
+			fmt.Errorf(
+				"background shutdown: %w",
+				workerShutdownCtx.Err(),
+			),
+		)
+	}
+
+	if runErr != nil {
+		logger.Error(
+			"RelayForge stopped with error",
+			"error", runErr,
+		)
+
+		return runErr
+	}
+
+	logger.Info("RelayForge stopped cleanly")
 
 	return nil
+
 }
 
 func httpAddress() string {
