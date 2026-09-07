@@ -1,2 +1,0 @@
-postgresql://relayforge:relayforge_dev_password@localhost:5432/relayforge
-postgresql://relayforge:relayforge_dev_password@localhost:5432/relayforge_test
